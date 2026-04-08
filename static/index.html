@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fast GroupMe Client</title>
+    <style>
+        body { font-family: monospace; background: #000; color: #0f0; margin: 0; display: flex; height: 100vh; overflow: hidden; }
+        #sidebar { width: 300px; border-right: 1px solid #0f0; display: flex; flex-direction: column; overflow: hidden; }
+        .sidebar-lists { overflow-y: auto; flex-grow: 1; padding: 10px; }
+        
+        h3 { margin-top: 0; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px dashed #0f0; padding-bottom: 5px;}
+        .new-btn { background: #0f0; color: #000; border: none; cursor: pointer; font-weight: bold; padding: 2px 5px; }
+        .new-btn:hover { background: #fff; }
+
+        #chat-pane { flex-grow: 1; display: flex; flex-direction: column; overflow: hidden; }
+        #chat-header { display: flex; justify-content: space-between; align-items: center; padding: 10px; border-bottom: 1px dashed #0f0; }
+        #chat-title { border: none; padding: 0; margin: 0; }
+        
+        #members-btn { background: #0aa; color: #000; border: none; padding: 5px 10px; font-family: monospace; font-weight: bold; cursor: pointer; display: none; }
+        #members-btn:hover { background: #0cc; }
+
+        #chat-history { flex-grow: 1; padding: 10px; overflow-y: auto; font-size: 14px; line-height: 1.4; display: flex; flex-direction: column; gap: 8px; }
+        
+        ul { list-style-type: none; padding: 0; margin: 0 0 20px 0; }
+        li { cursor: pointer; padding: 8px 0; border-bottom: 1px dashed #333; display: flex; justify-content: space-between;}
+        li:hover { background: #111; }
+        
+        .message-block { display: flex; flex-direction: column; }
+        .msg-meta { color: #888; font-size: 0.9em; margin-bottom: 2px; }
+        .msg-meta span { cursor: help; border-bottom: 1px dotted #888;}
+        .msg-text { white-space: pre-wrap; word-wrap: break-word; }
+        .msg-reply { margin-left: 10px; font-size: 0.9em; border-left: 1px dashed currentcolor; padding-left: 5px; }
+        .msg-img { max-width: 300px; max-height: 300px; margin-top: 5px; border: 1px solid currentcolor; }
+        
+        #input-area { display: flex; flex-wrap: wrap; padding: 10px; border-top: 1px dashed #0f0; background: #050505; gap: 10px; align-items: center; }
+        #msg-input { flex-grow: 1; background: #000; color: inherit; border: 1px solid #0f0; padding: 10px; font-family: monospace; outline: none; }
+        #img-input { color: #0f0; font-family: monospace; font-size: 0.9em; max-width: 200px; }
+        #send-btn { background: #0f0; color: #000; border: none; padding: 10px 20px; font-family: monospace; font-weight: bold; cursor: pointer; }
+        #send-btn:hover { background: #0c0; }
+        #send-btn:disabled { background: #333; color: #888; cursor: not-allowed; }
+    </style>
+</head>
+<body>
+
+    <div id="sidebar">
+        <div class="sidebar-lists">
+            <h3>Groups</h3>
+            <ul id="group-list"><li>Loading Groups...</li></ul>
+
+            <h3>Direct Messages <button class="new-btn" onclick="startNewDM()">+ NEW</button></h3>
+            <ul id="dm-list"><li>Loading DMs...</li></ul>
+        </div>
+    </div>
+
+    <div id="chat-pane">
+        <div id="chat-header">
+            <h3 id="chat-title">Select a chat</h3>
+            <button id="members-btn" onclick="downloadMembers()">MEMBERS</button>
+        </div>
+        <div id="chat-history"></div>
+        <div id="input-area">
+            <input type="text" id="msg-input" placeholder="Message... (Enter to send)" disabled>
+            <input type="file" id="img-input" accept="image/jpeg, image/png, image/gif" disabled>
+            <button id="send-btn" disabled>SEND</button>
+        </div>
+    </div>
+
+    <script>
+        let currentChatId = null;
+        let currentChatType = null;
+        let oldestMessageId = null;
+        let isLoading = false;
+        let pollInterval = null;
+        
+        const messageCache = new Map(); 
+        const displayedMessageIds = new Set(); // Tracks rendered messages to prevent duplicates
+        const groupsData = {}; // Caches group data for member downloads
+
+        function startNewDM() {
+            const userId = prompt("Enter the GroupMe User ID of the person you want to DM:");
+            if (userId) initChat('dm', userId, "User " + userId);
+        }
+
+        // Handles the file download from memory
+        function triggerDownload(filename, textContent) {
+            const blob = new Blob([textContent], { type: 'text/plain' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+        }
+
+        function downloadMembers() {
+            if (!currentChatId) return;
+
+            if (currentChatType === 'group' && groupsData[currentChatId]) {
+                const g = groupsData[currentChatId];
+                if (g.members) {
+                    let rosterText = `User IDs for ${g.name}\n----------------------\n`;
+                    g.members.forEach(m => rosterText += `${m.nickname}: ${m.user_id}\n`);
+                    triggerDownload(`${g.name.replace(/\s+/g, '_')}_IDs.txt`, rosterText);
+                } else {
+                    alert("No members data available.");
+                }
+            } else if (currentChatType === 'dm') {
+                const name = document.getElementById('chat-title').textContent.replace('DM: ', '');
+                let rosterText = `User ID for ${name}\n----------------------\n${name}: ${currentChatId}\n`;
+                triggerDownload(`${name.replace(/\s+/g, '_')}_ID.txt`, rosterText);
+            }
+        }
+
+        async function loadSidebar() {
+            try {
+                const res = await fetch('/api/groups');
+                const groups = await res.json();
+                const list = document.getElementById('group-list');
+                list.innerHTML = '';
+                groups.forEach(g => {
+                    groupsData[g.id] = g; // Cache the group for the download button
+                    const li = document.createElement('li');
+                    li.onclick = () => initChat('group', g.id, g.name);
+                    li.textContent = `> ${g.name}`;
+                    list.appendChild(li);
+                });
+            } catch (e) { document.getElementById('group-list').innerHTML = '<li>Error loading groups</li>'; }
+
+            try {
+                const res = await fetch('/api/chats');
+                const chats = await res.json();
+                const list = document.getElementById('dm-list');
+                list.innerHTML = '';
+                chats.forEach(c => {
+                    const li = document.createElement('li');
+                    li.onclick = () => initChat('dm', c.other_user.id, c.other_user.name);
+                    li.textContent = `@ ${c.other_user.name}`;
+                    list.appendChild(li);
+                });
+            } catch (e) { document.getElementById('dm-list').innerHTML = '<li>Error loading DMs</li>'; }
+        }
+
+        async function initChat(type, id, name) {
+            currentChatType = type;
+            currentChatId = id;
+            document.getElementById('chat-title').textContent = `${type.toUpperCase()}: ${name}`;
+            document.getElementById('msg-input').disabled = false;
+            document.getElementById('img-input').disabled = false;
+            document.getElementById('send-btn').disabled = false;
+            document.getElementById('members-btn').style.display = 'block';
+            
+            const history = document.getElementById('chat-history');
+            history.innerHTML = '<div style="color: #888;">Loading messages...</div>';
+            
+            displayedMessageIds.clear(); // Reset tracked messages for the new chat
+            
+            await fetchMessages(id, null, true);
+
+            // Start the 10-second live update loop
+            if (pollInterval) clearInterval(pollInterval);
+            pollInterval = setInterval(pollMessages, 10000);
+        }
+
+        // Refactored message creation logic so both fetch and poll can use it safely
+        function createMessageBlock(msg) {
+            const block = document.createElement('div');
+            block.className = 'message-block';
+
+            const meta = document.createElement('div');
+            meta.className = 'msg-meta';
+            const dateStr = new Date(msg.created_at * 1000).toLocaleString();
+            meta.innerHTML = `[<span title="User ID: ${msg.sender_id}">${msg.name}</span>] (${dateStr}):`;
+            block.appendChild(meta);
+
+            if (msg.text) {
+                const textSpan = document.createElement('div');
+                textSpan.className = 'msg-text';
+                textSpan.textContent = msg.text;
+                block.appendChild(textSpan);
+            }
+
+            if (msg.attachments) {
+                msg.attachments.forEach(att => {
+                    if (att.type === 'reply' && att.reply_id) {
+                        const replyDiv = document.createElement('div');
+                        replyDiv.className = 'msg-reply';
+                        const repliedName = messageCache.get(att.reply_id) || "older message";
+                        replyDiv.textContent = `└── Replying to: ${repliedName}`;
+                        block.appendChild(replyDiv);
+                    }
+                    if (att.type === 'image' && att.url) {
+                        const img = document.createElement('img');
+                        img.className = 'msg-img';
+                        img.src = att.url;
+                        block.appendChild(img);
+                    }
+                });
+            }
+            return block;
+        }
+
+        // Live updating interval function
+        async function pollMessages() {
+            if (!currentChatId || isLoading) return;
+            try {
+                const url = currentChatType === 'group' ? `/api/groups/${currentChatId}/messages` : `/api/chats/${currentChatId}/messages`;
+                const res = await fetch(url);
+                const messages = await res.json();
+                
+                // Filter out messages we already have loaded in the UI
+                const newMessages = messages.filter(msg => !displayedMessageIds.has(msg.id));
+                
+                if (newMessages.length > 0) {
+                    newMessages.reverse(); // Standardize chronological order
+                    const history = document.getElementById('chat-history');
+                    
+                    // Check if the user is currently looking at the bottom of the chat
+                    const isAtBottom = history.scrollHeight - history.scrollTop <= history.clientHeight + 100;
+                    
+                    const fragment = document.createDocumentFragment();
+                    newMessages.forEach(msg => {
+                        displayedMessageIds.add(msg.id);
+                        messageCache.set(msg.id, msg.name);
+                        fragment.appendChild(createMessageBlock(msg));
+                    });
+                    
+                    history.appendChild(fragment);
+                    
+                    // Auto-scroll only if they were already at the bottom
+                    if (isAtBottom) history.scrollTop = history.scrollHeight;
+                }
+            } catch (e) {
+                console.error("Polling error:", e);
+            }
+        }
+
+        async function fetchMessages(id, beforeId = null, isInitialLoad = false) {
+            if (isLoading) return;
+            isLoading = true;
+
+            try {
+                let url = currentChatType === 'group' ? `/api/groups/${id}/messages` : `/api/chats/${id}/messages`;
+                if (beforeId) url += `?before_id=${beforeId}`;
+
+                const res = await fetch(url);
+                const messages = await res.json();
+                
+                if (messages.length > 0) {
+                    oldestMessageId = messages[messages.length - 1].id;
+                    messages.reverse();
+
+                    const history = document.getElementById('chat-history');
+                    if (isInitialLoad) {
+                        history.innerHTML = '';
+                    }
+
+                    const fragment = document.createDocumentFragment();
+
+                    messages.forEach(msg => {
+                        // Protect against duplicate renders
+                        if (!displayedMessageIds.has(msg.id)) {
+                            displayedMessageIds.add(msg.id);
+                            messageCache.set(msg.id, msg.name);
+                            fragment.appendChild(createMessageBlock(msg));
+                        }
+                    });
+
+                    if (isInitialLoad) {
+                        history.appendChild(fragment);
+                        history.scrollTop = history.scrollHeight;
+                    } else {
+                        const oldScrollHeight = history.scrollHeight;
+                        history.prepend(fragment);
+                        history.scrollTop = history.scrollHeight - oldScrollHeight;
+                    }
+                }
+            } catch (e) {
+                console.error(e);
+            } finally {
+                isLoading = false;
+            }
+        }
+
+        // Load older messages if user scrolls to the absolute top
+        document.getElementById('chat-history').addEventListener('scroll', async (e) => {
+            if (e.target.scrollTop === 0 && currentChatId && oldestMessageId) {
+                await fetchMessages(currentChatId, oldestMessageId, false);
+            }
+        });
+
+        async function sendMessage() {
+            const input = document.getElementById('msg-input');
+            const fileInput = document.getElementById('img-input');
+            const btn = document.getElementById('send-btn');
+            
+            const text = input.value.trim();
+            const file = fileInput.files[0];
+            
+            if ((!text && !file) || !currentChatId) return;
+
+            btn.disabled = true;
+            btn.textContent = "SENDING...";
+
+            const guid = Date.now().toString(36) + Math.random().toString(36).substring(2);
+            let attachments = [];
+
+            if (file) {
+                try {
+                    const buffer = await file.arrayBuffer();
+                    const uploadRes = await fetch('/api/upload_image', {
+                        method: 'POST',
+                        headers: { 'Content-Type': file.type },
+                        body: buffer
+                    });
+                    
+                    if (uploadRes.ok) {
+                        const imgData = await uploadRes.json();
+                        attachments.push({ type: "image", url: imgData.payload.url });
+                    } else {
+                        alert("Image upload failed.");
+                        btn.disabled = false;
+                        btn.textContent = "SEND";
+                        return;
+                    }
+                } catch (e) {
+                    alert("Image upload error.");
+                    btn.disabled = false;
+                    btn.textContent = "SEND";
+                    return;
+                }
+            }
+
+            input.value = ''; 
+            fileInput.value = '';
+            
+            const url = currentChatType === 'group' ? `/api/groups/${currentChatId}/messages` : `/api/chats/${currentChatId}/messages`;
+
+            try {
+                await fetch(url, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ 
+                        text: text || null,
+                        source_guid: guid,
+                        attachments: attachments.length > 0 ? attachments : null
+                    })
+                });
+                
+                // Instantly poll to render our sent message rather than completely reloading the chat
+                await pollMessages();
+            } catch (e) { 
+                alert("Failed to send message."); 
+            } finally {
+                btn.disabled = false;
+                btn.textContent = "SEND";
+            }
+        }
+
+        document.getElementById('send-btn').addEventListener('click', sendMessage);
+        document.getElementById('msg-input').addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') sendMessage();
+        });
+
+        loadSidebar();
+    </script>
+</body>
+</html>
