@@ -26,6 +26,12 @@
         li { cursor: pointer; padding: 8px 0; border-bottom: 1px dashed #333; display: flex; justify-content: space-between;}
         li:hover { background: #111; }
         
+        .chat-name { flex-grow: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-right: 5px; }
+        .unread { color: #fff; font-weight: bold; }
+
+        .dl-link { color: #0aa; font-size: 0.8em; text-decoration: none; border: 1px solid #0aa; padding: 1px 4px; border-radius: 3px; height: 1em; line-height: 1em;}
+        .dl-link:hover { background: #0aa; color: #000; }
+        
         .message-block { display: flex; flex-direction: column; }
         .msg-meta { color: #888; font-size: 0.9em; margin-bottom: 2px; }
         .msg-meta span { cursor: help; border-bottom: 1px dotted #888;}
@@ -74,15 +80,15 @@
         let pollInterval = null;
         
         const messageCache = new Map(); 
-        const displayedMessageIds = new Set(); // Tracks rendered messages to prevent duplicates
-        const groupsData = {}; // Caches group data for member downloads
+        const displayedMessageIds = new Set();
+        const groupsData = {}; 
+        const chatStates = {}; // Tracks last message IDs to detect new messages
 
         function startNewDM() {
             const userId = prompt("Enter the GroupMe User ID of the person you want to DM:");
             if (userId) initChat('dm', userId, "User " + userId);
         }
 
-        // Handles the file download from memory
         function triggerDownload(filename, textContent) {
             const blob = new Blob([textContent], { type: 'text/plain' });
             const url = URL.createObjectURL(blob);
@@ -97,16 +103,13 @@
 
         function downloadMembers() {
             if (!currentChatId) return;
-
             if (currentChatType === 'group' && groupsData[currentChatId]) {
                 const g = groupsData[currentChatId];
                 if (g.members) {
                     let rosterText = `User IDs for ${g.name}\n----------------------\n`;
                     g.members.forEach(m => rosterText += `${m.nickname}: ${m.user_id}\n`);
                     triggerDownload(`${g.name.replace(/\s+/g, '_')}_IDs.txt`, rosterText);
-                } else {
-                    alert("No members data available.");
-                }
+                } else alert("No members data available.");
             } else if (currentChatType === 'dm') {
                 const name = document.getElementById('chat-title').textContent.replace('DM: ', '');
                 let rosterText = `User ID for ${name}\n----------------------\n${name}: ${currentChatId}\n`;
@@ -121,10 +124,20 @@
                 const list = document.getElementById('group-list');
                 list.innerHTML = '';
                 groups.forEach(g => {
-                    groupsData[g.id] = g; // Cache the group for the download button
+                    groupsData[g.id] = g;
+                    
+                    // Track state for notifications
+                    const lastMsgId = g.messages ? g.messages.last_message_id : null;
+                    chatStates[g.id] = { lastMsgId: lastMsgId, unread: false };
+
                     const li = document.createElement('li');
+                    li.id = `sidebar-group-${g.id}`;
                     li.onclick = () => initChat('group', g.id, g.name);
-                    li.textContent = `> ${g.name}`;
+                    
+                    const nameSpan = document.createElement('span');
+                    nameSpan.className = 'chat-name';
+                    nameSpan.textContent = `> ${g.name}`;
+                    li.appendChild(nameSpan);
                     list.appendChild(li);
                 });
             } catch (e) { document.getElementById('group-list').innerHTML = '<li>Error loading groups</li>'; }
@@ -135,12 +148,76 @@
                 const list = document.getElementById('dm-list');
                 list.innerHTML = '';
                 chats.forEach(c => {
+                    const id = c.other_user.id;
+                    const lastMsgId = c.last_message ? c.last_message.id : null;
+                    chatStates[id] = { lastMsgId: lastMsgId, unread: false };
+
                     const li = document.createElement('li');
-                    li.onclick = () => initChat('dm', c.other_user.id, c.other_user.name);
-                    li.textContent = `@ ${c.other_user.name}`;
+                    li.id = `sidebar-dm-${id}`;
+                    li.onclick = () => initChat('dm', id, c.other_user.name);
+                    
+                    const nameSpan = document.createElement('span');
+                    nameSpan.className = 'chat-name';
+                    nameSpan.textContent = `@ ${c.other_user.name}`;
+                    li.appendChild(nameSpan);
                     list.appendChild(li);
                 });
             } catch (e) { document.getElementById('dm-list').innerHTML = '<li>Error loading DMs</li>'; }
+
+            // Start polling the sidebar for unread messages every 15 seconds
+            setInterval(pollSidebarNotifications, 15000);
+        }
+
+        async function pollSidebarNotifications() {
+            try {
+                const [resG, resC] = await Promise.all([fetch('/api/groups'), fetch('/api/chats')]);
+                if (!resG.ok || !resC.ok) return;
+
+                const groups = await resG.json();
+                const chats = await resC.json();
+
+                groups.forEach(g => {
+                    const currentLast = g.messages ? g.messages.last_message_id : null;
+                    const state = chatStates[g.id];
+                    if (state && currentLast && currentLast !== state.lastMsgId) {
+                        if (currentChatId !== g.id) {
+                            state.unread = true;
+                            updateSidebarUI('group', g.id, g.name);
+                        } else {
+                            state.lastMsgId = currentLast; // We are actively in this chat
+                        }
+                    }
+                });
+
+                chats.forEach(c => {
+                    const id = c.other_user.id;
+                    const currentLast = c.last_message ? c.last_message.id : null;
+                    const state = chatStates[id];
+                    if (state && currentLast && currentLast !== state.lastMsgId) {
+                        if (currentChatId !== id) {
+                            state.unread = true;
+                            updateSidebarUI('dm', id, c.other_user.name);
+                        } else {
+                            state.lastMsgId = currentLast;
+                        }
+                    }
+                });
+            } catch (e) { console.error("Sidebar notification poll error:", e); }
+        }
+
+        function updateSidebarUI(type, id, name) {
+            const li = document.getElementById(`sidebar-${type}-${id}`);
+            if (li) {
+                const span = li.querySelector('.chat-name');
+                if (span) {
+                    const prefix = type === 'group' ? '>' : '@';
+                    const state = chatStates[id];
+                    
+                    span.textContent = `${prefix} ${name}${state.unread ? ' *' : ''}`;
+                    if (state.unread) span.classList.add('unread');
+                    else span.classList.remove('unread');
+                }
+            }
         }
 
         async function initChat(type, id, name) {
@@ -152,19 +229,22 @@
             document.getElementById('send-btn').disabled = false;
             document.getElementById('members-btn').style.display = 'block';
             
+            // Clear unread notification when clicked
+            if (chatStates[id]) {
+                chatStates[id].unread = false;
+                updateSidebarUI(type, id, name);
+            }
+
             const history = document.getElementById('chat-history');
             history.innerHTML = '<div style="color: #888;">Loading messages...</div>';
             
-            displayedMessageIds.clear(); // Reset tracked messages for the new chat
-            
+            displayedMessageIds.clear(); 
             await fetchMessages(id, null, true);
 
-            // Start the 10-second live update loop
             if (pollInterval) clearInterval(pollInterval);
             pollInterval = setInterval(pollMessages, 10000);
         }
 
-        // Refactored message creation logic so both fetch and poll can use it safely
         function createMessageBlock(msg) {
             const block = document.createElement('div');
             block.className = 'message-block';
@@ -202,7 +282,6 @@
             return block;
         }
 
-        // Live updating interval function
         async function pollMessages() {
             if (!currentChatId || isLoading) return;
             try {
@@ -210,17 +289,20 @@
                 const res = await fetch(url);
                 const messages = await res.json();
                 
-                // Filter out messages we already have loaded in the UI
                 const newMessages = messages.filter(msg => !displayedMessageIds.has(msg.id));
                 
                 if (newMessages.length > 0) {
-                    newMessages.reverse(); // Standardize chronological order
+                    newMessages.reverse(); 
+                    
+                    // Update our notification tracker so we don't trigger an unread badge on ourselves
+                    if (chatStates[currentChatId]) {
+                        chatStates[currentChatId].lastMsgId = newMessages[newMessages.length - 1].id;
+                    }
+
                     const history = document.getElementById('chat-history');
-                    
-                    // Check if the user is currently looking at the bottom of the chat
                     const isAtBottom = history.scrollHeight - history.scrollTop <= history.clientHeight + 100;
-                    
                     const fragment = document.createDocumentFragment();
+                    
                     newMessages.forEach(msg => {
                         displayedMessageIds.add(msg.id);
                         messageCache.set(msg.id, msg.name);
@@ -228,13 +310,9 @@
                     });
                     
                     history.appendChild(fragment);
-                    
-                    // Auto-scroll only if they were already at the bottom
                     if (isAtBottom) history.scrollTop = history.scrollHeight;
                 }
-            } catch (e) {
-                console.error("Polling error:", e);
-            }
+            } catch (e) { console.error("Polling error:", e); }
         }
 
         async function fetchMessages(id, beforeId = null, isInitialLoad = false) {
@@ -252,15 +330,15 @@
                     oldestMessageId = messages[messages.length - 1].id;
                     messages.reverse();
 
-                    const history = document.getElementById('chat-history');
-                    if (isInitialLoad) {
-                        history.innerHTML = '';
+                    if (isInitialLoad && chatStates[id]) {
+                        chatStates[id].lastMsgId = messages[messages.length - 1].id;
                     }
 
+                    const history = document.getElementById('chat-history');
+                    if (isInitialLoad) history.innerHTML = '';
                     const fragment = document.createDocumentFragment();
 
                     messages.forEach(msg => {
-                        // Protect against duplicate renders
                         if (!displayedMessageIds.has(msg.id)) {
                             displayedMessageIds.add(msg.id);
                             messageCache.set(msg.id, msg.name);
@@ -277,14 +355,10 @@
                         history.scrollTop = history.scrollHeight - oldScrollHeight;
                     }
                 }
-            } catch (e) {
-                console.error(e);
-            } finally {
-                isLoading = false;
-            }
+            } catch (e) { console.error(e); } 
+            finally { isLoading = false; }
         }
 
-        // Load older messages if user scrolls to the absolute top
         document.getElementById('chat-history').addEventListener('scroll', async (e) => {
             if (e.target.scrollTop === 0 && currentChatId && oldestMessageId) {
                 await fetchMessages(currentChatId, oldestMessageId, false);
@@ -349,11 +423,9 @@
                     })
                 });
                 
-                // Instantly poll to render our sent message rather than completely reloading the chat
                 await pollMessages();
-            } catch (e) { 
-                alert("Failed to send message."); 
-            } finally {
+            } catch (e) { alert("Failed to send message."); } 
+            finally {
                 btn.disabled = false;
                 btn.textContent = "SEND";
             }
