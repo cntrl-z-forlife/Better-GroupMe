@@ -2,6 +2,14 @@
 name = "groupme-rust-client"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+description = "A fast, terminal-style GroupMe client"
+repository = "https://github.com/cntrl-z-forlife/Better-GroupMe"
+authors = ["cntrl-z-forlife"]
+readme = "README.md"
+keywords = ["groupme", "chat", "messaging", "api-client"]
+categories = ["web-programming"]
+rust-version = "1.75"
 
 [dependencies]
 # The web framework
@@ -18,8 +26,17 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 # Utilities for serving files and logging
-tower-http = { version = "0.5", features = ["fs", "trace"] }
+tower-http = { version = "0.5", features = ["fs", "trace", "cors"] }
+tower = "0.4"
 
 # Logging and Debugging
 tracing = "0.1"
 tracing-subscriber = "0.3"
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
