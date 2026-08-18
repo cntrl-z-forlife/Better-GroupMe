@@ -1,18 +1,18 @@
 use axum::{
     body::Bytes,
     extract::{DefaultBodyLimit, Path, Query, State},
-    http::{HeaderMap, Method, StatusCode},
+    http::{header, HeaderMap, Method, StatusCode, Uri},
     response::IntoResponse,
     routing::get,
     Json, Router,
 };
 use reqwest::Client;
+use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tower::ServiceBuilder;
 use tower_http::{
     cors::{Any, CorsLayer},
-    services::ServeDir,
     trace::TraceLayer,
 };
 
@@ -20,6 +20,41 @@ use tower_http::{
 struct AppState {
     http_client: Client,
     api_token: String,
+}
+
+// --- Embedded static assets ---
+#[derive(Embed)]
+#[folder = "static/"]
+struct Assets;
+
+async fn static_handler(uri: Uri) -> impl IntoResponse {
+    let mut path = uri.path().trim_start_matches('/').to_string();
+    if path.is_empty() {
+        path = "index.html".to_string();
+    }
+
+    match Assets::get(&path) {
+        Some(file) => {
+            let mime = mime_guess::from_path(&path).first_or_octet_stream();
+            (
+                [(header::CONTENT_TYPE, mime.as_ref())],
+                file.data,
+            )
+                .into_response()
+        }
+        None => {
+            // Fallback to index.html
+            if let Some(file) = Assets::get("index.html") {
+                (
+                    [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                    file.data,
+                )
+                    .into_response()
+            } else {
+                (StatusCode::NOT_FOUND, "Not Found").into_response()
+            }
+        }
+    }
 }
 
 // --- Group Structs ---
@@ -179,14 +214,23 @@ async fn main() {
         .route("/api/chats", get(get_chats))
         .route("/api/chats/{other_user_id}/messages", get(get_dm_messages).post(send_dm_message))
         .route("/api/upload_image", axum::routing::post(upload_image))
-        .layer(ServiceBuilder::new()
-            .layer(DefaultBodyLimit::max(15 * 1024 * 1024)) // 15MB limit for images
-            .layer(cors)
-            .layer(TraceLayer::new_for_http()))
-        .fallback_service(ServeDir::new("static"))
+        .fallback(static_handler)
+        .layer(
+            ServiceBuilder::new()
+                // TraceLayer MUST be outermost so Cors sees a Default-able body
+                .layer(TraceLayer::new_for_http())
+                .layer(cors)
+                .layer(DefaultBodyLimit::max(15 * 1024 * 1024)), // 15MB limit for images
+        )
         .with_state(state);
 
     tracing::info!("Server running on http://0.0.0.0:8080");
+
+    // Open the default browser
+    if let Err(e) = open::that("http://localhost:8080") {
+        tracing::warn!("Could not open browser automatically: {}", e);
+    }
+
     let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
