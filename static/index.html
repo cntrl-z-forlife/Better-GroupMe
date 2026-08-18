@@ -331,7 +331,16 @@
             try {
                 const url = currentChatType === 'group' ? `/api/groups/${currentChatId}/messages` : `/api/chats/${currentChatId}/messages`;
                 const res = await fetch(url);
-                const messages = await res.json();
+if (!res.ok) {
+    history.innerHTML = `<div style="color:red;">Error loading messages (${res.status})</div>`;
+    return;
+}
+const messages = await res.json();
+if (!Array.isArray(messages)) {
+    history.innerHTML = '<div style="color:red;">Unexpected response from server</div>';
+    return;
+}
+// … rest of the logic
                 
                 const newMessages = messages.filter(msg => !displayedMessageIds.has(msg.id));
                 
