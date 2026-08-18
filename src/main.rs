@@ -3,13 +3,15 @@ use axum::{
     extract::{DefaultBodyLimit, Path, Query, State},
     http::{header, HeaderMap, Method, StatusCode, Uri},
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use reqwest::Client;
 use rust_embed::Embed;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use tower::ServiceBuilder;
 use tower_http::{
     cors::{Any, CorsLayer},
@@ -19,7 +21,7 @@ use tower_http::{
 // --- App State ---
 struct AppState {
     http_client: Client,
-    api_token: String,
+    api_token: Arc<RwLock<Option<String>>>,
 }
 
 // --- Embedded static assets ---
@@ -43,7 +45,6 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
                 .into_response()
         }
         None => {
-            // Fallback to index.html
             if let Some(file) = Assets::get("index.html") {
                 (
                     [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
@@ -57,6 +58,33 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
     }
 }
 
+// --- Token helpers ---
+fn token_file_path() -> Option<PathBuf> {
+    let mut path = std::env::current_exe().ok()?;
+    path.set_file_name("groupme_token");
+    Some(path)
+}
+
+fn load_token_from_file() -> Option<String> {
+    let path = token_file_path()?;
+    std::fs::read_to_string(&path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn save_token_to_file(token: &str) -> Result<(), String> {
+    let path = token_file_path().ok_or("Could not determine executable path")?;
+    std::fs::write(&path, token).map_err(|e| format!("Failed to write token file: {}", e))
+}
+
+async fn get_token(state: &AppState) -> Result<String, StatusCode> {
+    let guard = state.api_token.read().await;
+    guard
+        .clone()
+        .ok_or(StatusCode::UNAUTHORIZED)
+}
+
 // --- Group Structs ---
 #[derive(Deserialize, Serialize)]
 struct GroupMeResponse {
@@ -67,7 +95,7 @@ struct GroupMeResponse {
 struct Group {
     id: String,
     name: String,
-    members: Option<Vec<Member>>, // Added to download User IDs
+    members: Option<Vec<Member>>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -117,8 +145,8 @@ struct DMData {
 #[derive(Deserialize, Serialize)]
 struct Message {
     id: String,
-    created_at: i64,      // Added for Timestamps
-    sender_id: String,    // Added for ID Hover
+    created_at: i64,
+    sender_id: String,
     name: String,
     text: Option<String>,
     attachments: Option<Vec<Attachment>>,
@@ -139,7 +167,7 @@ struct Attachment {
 struct SendMessageReq {
     text: Option<String>,
     source_guid: String,
-    attachments: Option<Vec<Attachment>>, // Added for sending images
+    attachments: Option<Vec<Attachment>>,
 }
 
 #[derive(Serialize)]
@@ -176,9 +204,18 @@ struct MessageParams {
     before_id: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct SetTokenReq {
+    token: String,
+}
+
+#[derive(Serialize)]
+struct StatusResponse {
+    has_token: bool,
+}
+
 // --- Validation Helper ---
 fn validate_id(id: &str) -> Result<(), String> {
-    // GroupMe IDs are alphanumeric with possible hyphens
     if id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') && !id.is_empty() {
         Ok(())
     } else {
@@ -186,7 +223,6 @@ fn validate_id(id: &str) -> Result<(), String> {
     }
 }
 
-// --- API Error Helper ---
 fn api_error_response<T: std::fmt::Display>(err: T, context: &str) -> impl IntoResponse {
     tracing::error!("{}: {}", context, err);
     (StatusCode::BAD_GATEWAY, format!("{} failed", context)).into_response()
@@ -194,39 +230,57 @@ fn api_error_response<T: std::fmt::Display>(err: T, context: &str) -> impl IntoR
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).init();
-    let api_token = std::env::var("GROUPME_TOKEN").expect("GROUPME_TOKEN must be set");
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .init();
+
+    // Resolve token: env var → file next to binary
+    let initial_token = std::env::var("GROUPME_TOKEN")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(load_token_from_file);
+
+    if initial_token.is_some() {
+        tracing::info!("GroupMe token loaded");
+    } else {
+        tracing::warn!("No GroupMe token found — open the UI to set one");
+    }
 
     let state = Arc::new(AppState {
         http_client: Client::new(),
-        api_token,
+        api_token: Arc::new(RwLock::new(initial_token)),
     });
 
-    // Configure CORS
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods([Method::GET, Method::POST])
         .allow_headers(Any);
 
     let app = Router::new()
+        .route("/api/status", get(get_status))
+        .route("/api/set_token", post(set_token))
         .route("/api/groups", get(get_groups))
-        .route("/api/groups/{group_id}/messages", get(get_group_messages).post(send_group_message))
+        .route(
+            "/api/groups/{group_id}/messages",
+            get(get_group_messages).post(send_group_message),
+        )
         .route("/api/chats", get(get_chats))
-        .route("/api/chats/{other_user_id}/messages", get(get_dm_messages).post(send_dm_message))
-        .route("/api/upload_image", axum::routing::post(upload_image))
+        .route(
+            "/api/chats/{other_user_id}/messages",
+            get(get_dm_messages).post(send_dm_message),
+        )
+        .route("/api/upload_image", post(upload_image))
         .fallback(static_handler)
         .layer(
             ServiceBuilder::new()
-                // TraceLayer MUST be outermost so Cors sees a Default-able body
                 .layer(TraceLayer::new_for_http())
                 .layer(cors)
-                .layer(DefaultBodyLimit::max(15 * 1024 * 1024)), // 15MB limit for images
+                .layer(DefaultBodyLimit::max(15 * 1024 * 1024)),
         )
         .with_state(state);
 
-    tracing::info!("Server running on http://0.0.0.0:8080");
+    tracing::info!("Server running on http://localhost:8080");
 
-    // Open the default browser
     if let Err(e) = open::that("http://localhost:8080") {
         tracing::warn!("Could not open browser automatically: {}", e);
     }
@@ -235,27 +289,62 @@ async fn main() {
     axum::serve(listener, app).await.unwrap();
 }
 
+// --- Token endpoints ---
+async fn get_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let has_token = state.api_token.read().await.is_some();
+    Json(StatusResponse { has_token })
+}
+
+async fn set_token(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<SetTokenReq>,
+) -> impl IntoResponse {
+    let token = payload.token.trim().to_string();
+    if token.is_empty() {
+        return (StatusCode::BAD_REQUEST, "Token cannot be empty").into_response();
+    }
+
+    if let Err(e) = save_token_to_file(&token) {
+        tracing::error!("{}", e);
+        // Still keep it in memory even if file write fails
+    }
+
+    *state.api_token.write().await = Some(token);
+    tracing::info!("GroupMe token saved");
+    StatusCode::OK.into_response()
+}
+
 // --- Image Proxy Handler ---
 async fn upload_image(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    let content_type = headers.get("Content-Type").and_then(|v| v.to_str().ok()).unwrap_or("image/jpeg");
-    
-    // Validate content type
+    let api_token = match get_token(&state).await {
+        Ok(t) => t,
+        Err(status) => return status.into_response(),
+    };
+
+    let content_type = headers
+        .get("Content-Type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("image/jpeg");
+
     let allowed_types = ["image/jpeg", "image/png", "image/gif", "image/webp"];
     if !allowed_types.contains(&content_type) {
         return (StatusCode::BAD_REQUEST, "Invalid content type").into_response();
     }
-    
+
     let url = "https://image.groupme.com/pictures";
-    
-    match state.http_client.post(url)
-        .header("X-Access-Token", &state.api_token)
+
+    match state
+        .http_client
+        .post(url)
+        .header("X-Access-Token", &api_token)
         .header("Content-Type", content_type)
         .body(body)
-        .send().await 
+        .send()
+        .await
     {
         Ok(res) => {
             if let Ok(data) = res.json::<serde_json::Value>().await {
@@ -274,12 +363,20 @@ async fn upload_image(
 
 // --- Group Handlers ---
 async fn get_groups(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let api_token = match get_token(&state).await {
+        Ok(t) => t,
+        Err(status) => return status.into_response(),
+    };
+
     let url = "https://api.groupme.com/v3/groups";
-    
-    match state.http_client.get(url)
-        .header("X-Access-Token", &state.api_token)
+
+    match state
+        .http_client
+        .get(url)
+        .header("X-Access-Token", &api_token)
         .query(&[("per_page", "500")])
-        .send().await 
+        .send()
+        .await
     {
         Ok(res) => {
             if let Ok(data) = res.json::<GroupMeResponse>().await {
@@ -294,23 +391,28 @@ async fn get_groups(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 }
 
 async fn get_group_messages(
-    State(state): State<Arc<AppState>>, 
-    Path(group_id): Path<String>, 
-    Query(params): Query<MessageParams>
+    State(state): State<Arc<AppState>>,
+    Path(group_id): Path<String>,
+    Query(params): Query<MessageParams>,
 ) -> impl IntoResponse {
-    // Validate group_id
+    let api_token = match get_token(&state).await {
+        Ok(t) => t,
+        Err(status) => return status.into_response(),
+    };
+
     if let Err(e) = validate_id(&group_id) {
         return (StatusCode::BAD_REQUEST, e).into_response();
     }
-    
+
     let url = format!("https://api.groupme.com/v3/groups/{}/messages", group_id);
-    
-    let mut request = state.http_client.get(&url)
-        .header("X-Access-Token", &state.api_token)
+
+    let mut request = state
+        .http_client
+        .get(&url)
+        .header("X-Access-Token", &api_token)
         .query(&[("limit", "50")]);
-    
+
     if let Some(ref before_id) = params.before_id {
-        // Validate before_id too
         if validate_id(before_id).is_err() {
             return (StatusCode::BAD_REQUEST, "Invalid before_id format").into_response();
         }
@@ -319,11 +421,11 @@ async fn get_group_messages(
 
     match request.send().await {
         Ok(res) => {
-            if let Ok(data) = res.json::<MessagesResponse>().await { 
-                (StatusCode::OK, Json(data.response.messages)).into_response() 
-            } else { 
+            if let Ok(data) = res.json::<MessagesResponse>().await {
+                (StatusCode::OK, Json(data.response.messages)).into_response()
+            } else {
                 tracing::error!("Failed to parse messages response for group {}", group_id);
-                (StatusCode::INTERNAL_SERVER_ERROR, "Parse error").into_response() 
+                (StatusCode::INTERNAL_SERVER_ERROR, "Parse error").into_response()
             }
         }
         Err(e) => api_error_response(e, "Messages fetch").into_response(),
@@ -331,29 +433,36 @@ async fn get_group_messages(
 }
 
 async fn send_group_message(
-    State(state): State<Arc<AppState>>, 
-    Path(group_id): Path<String>, 
-    Json(payload): Json<SendMessageReq>
+    State(state): State<Arc<AppState>>,
+    Path(group_id): Path<String>,
+    Json(payload): Json<SendMessageReq>,
 ) -> impl IntoResponse {
-    // Validate group_id
+    let api_token = match get_token(&state).await {
+        Ok(t) => t,
+        Err(status) => return status.into_response(),
+    };
+
     if let Err(e) = validate_id(&group_id) {
         return (StatusCode::BAD_REQUEST, e).into_response();
     }
-    
+
     let url = format!("https://api.groupme.com/v3/groups/{}/messages", group_id);
-    
-    let gm_payload = GroupMeSendPayload { 
-        message: GroupMeSendMessage { 
-            source_guid: payload.source_guid, 
-            text: payload.text, 
-            attachments: payload.attachments 
-        } 
+
+    let gm_payload = GroupMeSendPayload {
+        message: GroupMeSendMessage {
+            source_guid: payload.source_guid,
+            text: payload.text,
+            attachments: payload.attachments,
+        },
     };
-    
-    match state.http_client.post(&url)
-        .header("X-Access-Token", &state.api_token)
+
+    match state
+        .http_client
+        .post(&url)
+        .header("X-Access-Token", &api_token)
         .json(&gm_payload)
-        .send().await 
+        .send()
+        .await
     {
         Ok(res) if res.status().is_success() => StatusCode::OK.into_response(),
         Ok(res) => {
@@ -366,19 +475,27 @@ async fn send_group_message(
 
 // --- DM Handlers ---
 async fn get_chats(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let api_token = match get_token(&state).await {
+        Ok(t) => t,
+        Err(status) => return status.into_response(),
+    };
+
     let url = "https://api.groupme.com/v3/chats";
-    
-    match state.http_client.get(url)
-        .header("X-Access-Token", &state.api_token)
+
+    match state
+        .http_client
+        .get(url)
+        .header("X-Access-Token", &api_token)
         .query(&[("per_page", "100")])
-        .send().await 
+        .send()
+        .await
     {
         Ok(res) => {
-            if let Ok(data) = res.json::<ChatsResponse>().await { 
-                (StatusCode::OK, Json(data.response)).into_response() 
-            } else { 
+            if let Ok(data) = res.json::<ChatsResponse>().await {
+                (StatusCode::OK, Json(data.response)).into_response()
+            } else {
                 tracing::error!("Failed to parse chats response");
-                (StatusCode::INTERNAL_SERVER_ERROR, "Parse error").into_response() 
+                (StatusCode::INTERNAL_SERVER_ERROR, "Parse error").into_response()
             }
         }
         Err(e) => api_error_response(e, "Chats fetch").into_response(),
@@ -386,24 +503,29 @@ async fn get_chats(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 }
 
 async fn get_dm_messages(
-    State(state): State<Arc<AppState>>, 
-    Path(other_user_id): Path<String>, 
-    Query(params): Query<MessageParams>
+    State(state): State<Arc<AppState>>,
+    Path(other_user_id): Path<String>,
+    Query(params): Query<MessageParams>,
 ) -> impl IntoResponse {
-    // Validate user_id
+    let api_token = match get_token(&state).await {
+        Ok(t) => t,
+        Err(status) => return status.into_response(),
+    };
+
     if let Err(e) = validate_id(&other_user_id) {
         return (StatusCode::BAD_REQUEST, e).into_response();
     }
-    
+
     let url = "https://api.groupme.com/v3/direct_messages";
-    
-    let mut request = state.http_client.get(url)
-        .header("X-Access-Token", &state.api_token)
+
+    let mut request = state
+        .http_client
+        .get(url)
+        .header("X-Access-Token", &api_token)
         .query(&[("other_user_id", other_user_id.as_str())])
         .query(&[("limit", "50")]);
-    
+
     if let Some(ref before_id) = params.before_id {
-        // Validate before_id
         if validate_id(before_id).is_err() {
             return (StatusCode::BAD_REQUEST, "Invalid before_id format").into_response();
         }
@@ -412,11 +534,14 @@ async fn get_dm_messages(
 
     match request.send().await {
         Ok(res) => {
-            if let Ok(data) = res.json::<DMDataResponse>().await { 
-                (StatusCode::OK, Json(data.response.direct_messages)).into_response() 
-            } else { 
-                tracing::error!("Failed to parse DM messages response for user {}", other_user_id);
-                (StatusCode::INTERNAL_SERVER_ERROR, "Parse error").into_response() 
+            if let Ok(data) = res.json::<DMDataResponse>().await {
+                (StatusCode::OK, Json(data.response.direct_messages)).into_response()
+            } else {
+                tracing::error!(
+                    "Failed to parse DM messages response for user {}",
+                    other_user_id
+                );
+                (StatusCode::INTERNAL_SERVER_ERROR, "Parse error").into_response()
             }
         }
         Err(e) => api_error_response(e, "DM messages fetch").into_response(),
@@ -424,30 +549,37 @@ async fn get_dm_messages(
 }
 
 async fn send_dm_message(
-    State(state): State<Arc<AppState>>, 
-    Path(other_user_id): Path<String>, 
-    Json(payload): Json<SendMessageReq>
+    State(state): State<Arc<AppState>>,
+    Path(other_user_id): Path<String>,
+    Json(payload): Json<SendMessageReq>,
 ) -> impl IntoResponse {
-    // Validate recipient_id
+    let api_token = match get_token(&state).await {
+        Ok(t) => t,
+        Err(status) => return status.into_response(),
+    };
+
     if let Err(e) = validate_id(&other_user_id) {
         return (StatusCode::BAD_REQUEST, e).into_response();
     }
-    
+
     let url = "https://api.groupme.com/v3/direct_messages";
-    
-    let gm_payload = GroupMeSendDMPayload { 
-        direct_message: GroupMeSendDM { 
-            source_guid: payload.source_guid, 
-            recipient_id: other_user_id, 
-            text: payload.text, 
-            attachments: payload.attachments 
-        } 
+
+    let gm_payload = GroupMeSendDMPayload {
+        direct_message: GroupMeSendDM {
+            source_guid: payload.source_guid,
+            recipient_id: other_user_id,
+            text: payload.text,
+            attachments: payload.attachments,
+        },
     };
-    
-    match state.http_client.post(url)
-        .header("X-Access-Token", &state.api_token)
+
+    match state
+        .http_client
+        .post(url)
+        .header("X-Access-Token", &api_token)
         .json(&gm_payload)
-        .send().await 
+        .send()
+        .await
     {
         Ok(res) if res.status().is_success() => StatusCode::OK.into_response(),
         Ok(res) => {
