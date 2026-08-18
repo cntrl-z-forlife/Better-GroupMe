@@ -1,3 +1,4 @@
+
 use axum::{
     body::Bytes,
     extract::{DefaultBodyLimit, Path, Query, State},
@@ -146,6 +147,7 @@ struct DMData {
 struct Message {
     id: String,
     created_at: i64,
+    #[serde(rename = "user_id")]
     sender_id: String,
     name: String,
     text: Option<String>,
@@ -257,16 +259,14 @@ async fn main() {
         .allow_headers(Any);
 
     let app = Router::new()
-        .route("/api/status", get(get_status))
-        .route("/api/set_token", post(set_token))
         .route("/api/groups", get(get_groups))
         .route(
-            "/api/groups/{group_id}/messages",
+            "/api/groups/:group_id/messages", // <-- Changed {group_id} to :group_id
             get(get_group_messages).post(send_group_message),
         )
         .route("/api/chats", get(get_chats))
         .route(
-            "/api/chats/{other_user_id}/messages",
+            "/api/chats/:other_user_id/messages", // <-- Changed {other_user_id} to :other_user_id
             get(get_dm_messages).post(send_dm_message),
         )
         .route("/api/upload_image", post(upload_image))
