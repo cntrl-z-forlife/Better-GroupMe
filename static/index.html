@@ -45,9 +45,50 @@
         #send-btn { background: #0f0; color: #000; border: none; padding: 10px 20px; font-family: monospace; font-weight: bold; cursor: pointer; }
         #send-btn:hover { background: #0c0; }
         #send-btn:disabled { background: #333; color: #888; cursor: not-allowed; }
+
+        /* Token setup modal */
+        #token-modal {
+            position: fixed; inset: 0; background: #000; color: #0f0;
+            display: flex; flex-direction: column; align-items: center; justify-content: center;
+            z-index: 9999; font-family: monospace; padding: 20px; text-align: center;
+        }
+        #token-modal.hidden { display: none; }
+        #token-modal h2 { margin-bottom: 10px; border-bottom: 1px dashed #0f0; padding-bottom: 8px; }
+        #token-modal p { max-width: 520px; line-height: 1.5; color: #0c0; margin: 12px 0; }
+        #token-modal a { color: #0ff; }
+        #token-input {
+            width: min(480px, 90vw); background: #000; color: #0f0;
+            border: 1px solid #0f0; padding: 12px; font-family: monospace; font-size: 14px;
+            outline: none; margin: 16px 0;
+        }
+        #token-save {
+            background: #0f0; color: #000; border: none; padding: 10px 28px;
+            font-family: monospace; font-weight: bold; cursor: pointer; font-size: 14px;
+        }
+        #token-save:hover { background: #fff; }
+        #token-error { color: #f55; margin-top: 12px; min-height: 1.2em; }
+        #token-btn {
+            background: transparent; color: #0aa; border: 1px solid #0aa;
+            padding: 2px 8px; font-family: monospace; cursor: pointer; font-size: 12px; margin-left: 8px;
+        }
+        #token-btn:hover { background: #0aa; color: #000; }
     </style>
 </head>
 <body>
+
+    <div id="token-modal" class="hidden">
+        <h2>GroupMe Access Token</h2>
+        <p>
+            Paste your personal access token below.<br>
+            Get it from
+            <a href="https://dev.groupme.com/" target="_blank" rel="noopener">dev.groupme.com</a>
+            (log in — the token is shown in the top-right).
+        </p>
+        <input id="token-input" type="password" placeholder="Paste access token here..." autocomplete="off" />
+        <button id="token-save">SAVE &amp; CONTINUE</button>
+        <div id="token-error"></div>
+    </div>
+
 
     <div id="sidebar">
         <div class="sidebar-lists">
@@ -62,7 +103,10 @@
     <div id="chat-pane">
         <div id="chat-header">
             <h3 id="chat-title">Select a chat</h3>
-            <button id="members-btn" onclick="downloadMembers()">MEMBERS</button>
+            <div>
+                <button id="members-btn" onclick="downloadMembers()">MEMBERS</button>
+                <button id="token-btn" title="Change access token">TOKEN</button>
+            </div>
         </div>
         <div id="chat-history"></div>
         <div id="input-area">
@@ -436,7 +480,61 @@
             if (e.key === 'Enter') sendMessage();
         });
 
-        loadSidebar();
+        // --- Token setup ---
+        async function checkTokenAndStart() {
+            try {
+                const res = await fetch('/api/status');
+                const data = await res.json();
+                if (data.has_token) {
+                    document.getElementById('token-modal').classList.add('hidden');
+                    loadSidebar();
+                } else {
+                    document.getElementById('token-modal').classList.remove('hidden');
+                }
+            } catch (e) {
+                document.getElementById('token-modal').classList.remove('hidden');
+            }
+        }
+
+        document.getElementById('token-save').addEventListener('click', async () => {
+            const input = document.getElementById('token-input');
+            const err = document.getElementById('token-error');
+            const token = input.value.trim();
+            if (!token) {
+                err.textContent = 'Token cannot be empty';
+                return;
+            }
+            err.textContent = 'Saving...';
+            try {
+                const res = await fetch('/api/set_token', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ token })
+                });
+                if (res.ok) {
+                    document.getElementById('token-modal').classList.add('hidden');
+                    input.value = '';
+                    err.textContent = '';
+                    loadSidebar();
+                } else {
+                    err.textContent = 'Failed to save token';
+                }
+            } catch (e) {
+                err.textContent = 'Network error while saving';
+            }
+        });
+
+        document.getElementById('token-input').addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') document.getElementById('token-save').click();
+        });
+
+        document.getElementById('token-btn').addEventListener('click', () => {
+            document.getElementById('token-modal').classList.remove('hidden');
+            document.getElementById('token-input').focus();
+        });
+
+        // Start
+        checkTokenAndStart();
     </script>
 </body>
 </html>
